@@ -23,12 +23,7 @@ services:
         condition: service_healthy
       meili-init:
         condition: service_completed_successfully
-    command: >
-      sh -c "
-      yarn medusa db:migrate &&
-      yarn medusa user -e admin@medusa.local -p supersecret || echo 'Admin user already exists' &&
-      yarn start
-      "
+    command: ["sh", "/app/entrypoint.sh"]
 
   # ============================
   # STOREFRONT
@@ -47,6 +42,7 @@ services:
         condition: service_started
       meili-init:
         condition: service_completed_successfully
+    command: ["sh", "/app/entrypoint.sh"]
 
   # ============================
   # POSTGRES
