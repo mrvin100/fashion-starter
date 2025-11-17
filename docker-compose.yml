@@ -1,0 +1,243 @@
+# Production Docker Compose for Fashion Starter
+# Complete production setup with all services
+
+services:
+  # ============================
+  # POSTGRES DATABASE
+  # ============================
+  postgres:
+    image: postgres:16
+    container_name: postgres-db
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+      - POSTGRES_DB=${POSTGRES_DB:-medusa}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - app-network
+
+  # ============================
+  # REDIS CACHE
+  # ============================
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - app-network
+
+  # ============================
+  # MINIO (S3 Compatible Storage)
+  # ============================
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: minio-storage
+    restart: unless-stopped
+    ports:
+      - "${MINIO_API_PORT:-9090}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    environment:
+      - MINIO_ROOT_USER=${MINIO_USER:-medusaminio}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD:-medusaminio}
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - app-network
+
+  # ============================
+  # MINIO BUCKET INITIALIZATION
+  # ============================
+  minio-init:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - MINIO_ROOT_USER=${MINIO_USER:-medusaminio}
+      - MINIO_ROOT_PASSWORD=${MINIO_PASSWORD:-medusaminio}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set myminio http://minio:9000 ${MINIO_USER:-medusaminio} ${MINIO_PASSWORD:-medusaminio}; do
+        echo 'Waiting for minio...'
+        sleep 2
+      done
+      mc mb myminio/medusa || true
+      mc anonymous set public myminio/medusa
+      echo 'Minio bucket initialized successfully'
+      "
+    networks:
+      - app-network
+
+  # ============================
+  # MEILISEARCH
+  # ============================
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    container_name: meilisearch
+    restart: unless-stopped
+    ports:
+      - "${MEILISEARCH_PORT:-7700}:7700"
+    volumes:
+      - meilisearch-data:/meili_data
+    environment:
+      - MEILI_MASTER_KEY=${MEILISEARCH_MASTER_KEY:-yoursecretmasterkey}
+      - MEILI_ENV=production
+      - MEILI_NO_ANALYTICS=true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - app-network
+
+  # ============================
+  # MEDUSA BACKEND
+  # ============================
+  medusa:
+    build:
+      context: ./medusa
+      dockerfile: Dockerfile
+    container_name: medusa-server
+    restart: unless-stopped
+    ports:
+      - "${MEDUSA_PORT:-9000}:9000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-medusa}
+      - REDIS_URL=redis://redis:6379
+      - STORE_CORS=http://localhost:${STOREFRONT_PORT:-8000}
+      - ADMIN_CORS=http://localhost:7000,http://localhost:7001
+      - JWT_SECRET=${JWT_SECRET:-supersecret}
+      - COOKIE_SECRET=${COOKIE_SECRET:-supersecret}
+      # MinIO Configuration
+      - S3_ENDPOINT=http://minio:9000
+      - S3_ACCESS_KEY_ID=${MINIO_USER:-medusaminio}
+      - S3_SECRET_ACCESS_KEY=${MINIO_PASSWORD:-medusaminio}
+      - S3_BUCKET=medusa
+      - S3_REGION=us-east-1
+      - S3_FORCE_PATH_STYLE=true
+      - S3_FILE_URL=http://localhost:${MINIO_API_PORT:-9090}/medusa
+      # MeiliSearch Configuration
+      - MEILISEARCH_HOST=http://meilisearch:7700
+      - MEILISEARCH_API_KEY=${MEILISEARCH_MASTER_KEY:-yoursecretmasterkey}
+      # Stripe Configuration
+      - STRIPE_API_KEY=${STRIPE_API_KEY}
+      # Resend Configuration
+      - RESEND_API_KEY=${RESEND_API_KEY}
+      - RESEND_FROM=${RESEND_FROM:-"Agilo <noreply@agilo.com>"}
+    command: >
+      sh -c "
+        echo '🚀 Starting Medusa Server...'
+        echo '⏳ Waiting for database...'
+        until pg_isready -h postgres -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-medusa}; do
+          echo '⏰ Waiting for postgres...'
+          sleep 2
+        done
+        echo '⏳ Waiting for Redis...'
+        until redis-cli -h redis ping | grep -q 'PONG'; do
+          echo '⏰ Waiting for redis...'
+          sleep 2
+        done
+        echo '📦 Running migrations and seeding...'
+        if [ ! -f /tmp/.medusa_initialized ]; then
+          yarn medusa db:migrate
+          yarn seed
+          yarn medusa user -e admin@medusa.local -p supersecret || echo '⚠️ Admin user already exists'
+          touch /tmp/.medusa_initialized
+          echo '✅ Medusa initialization completed!'
+        else
+          echo '✅ Medusa already initialized, skipping...'
+        fi
+        echo '🎯 Starting Medusa server...'
+        exec yarn start
+      "
+    volumes:
+      - medusa-init:/tmp
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================
+  # STOREFRONT
+  # ============================
+  storefront:
+    build:
+      context: ./storefront
+      dockerfile: Dockerfile
+    container_name: storefront
+    restart: unless-stopped
+    ports:
+      - "${STOREFRONT_PORT:-8000}:8000"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_MEDUSA_BACKEND_URL=http://localhost:${MEDUSA_PORT:-9000}
+      - NEXT_PUBLIC_BASE_URL=http://localhost:${STOREFRONT_PORT:-8000}
+      - NEXT_PUBLIC_SEARCH_ENDPOINT=http://localhost:${MEILISEARCH_PORT:-7700}
+      - NEXT_PUBLIC_FEATURE_SEARCH_ENABLED=true
+      - NEXT_PUBLIC_DEFAULT_REGION=us
+      - REVALIDATE_SECRET=${JWT_SECRET:-supersecret}
+      # Keys (will be set after initial setup)
+      - NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY=${NEXT_PUBLIC_MEDUSA_PUBLISHABLE_KEY}
+      - NEXT_PUBLIC_SEARCH_API_KEY=${NEXT_PUBLIC_SEARCH_API_KEY}
+      - NEXT_PUBLIC_STRIPE_KEY=${NEXT_PUBLIC_STRIPE_KEY}
+      - NEXT_PUBLIC_PAYPAL_CLIENT_ID=${NEXT_PUBLIC_PAYPAL_CLIENT_ID}
+    depends_on:
+      medusa:
+        condition: service_healthy
+      meilisearch:
+        condition: service_healthy
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  minio-data:
+  meilisearch-data:
+  medusa-init:
