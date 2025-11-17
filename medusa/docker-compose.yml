@@ -36,7 +36,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ../storefront/.env
+      - ../storefront/.env.template
     depends_on:
       medusa:
         condition: service_started
